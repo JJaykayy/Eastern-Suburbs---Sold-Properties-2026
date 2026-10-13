@@ -10,6 +10,7 @@ Omit --apply for a dry run that only writes the report. Reads .numbers, .csv,
 Requires: openpyxl, and numbers-parser for .numbers exports.
 """
 import re, sys, json, copy, difflib
+from datetime import date
 from collections import defaultdict, OrderedDict
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -29,6 +30,10 @@ MONTH_RE = re.compile(r'^\s*(' + '|'.join(MONTHS) + r')\s*\((\d+)\)\s*$', re.I)
 GREEN = 'FF93C47D'          # month-header fill
 BLUE = 'FF4285F4'           # address font colour
 MONEY = '"$"#,##0'          # Sale Price / Rate PM2 number format
+# Month headers carry no year; every sheet in this workbook is one calendar year.
+_y = re.search(r'(20\d\d)', WB_PATH)
+WB_YEAR = int(_y.group(1)) if _y else 2026
+RESALE_DAYS = 60            # 'more than ~60 days apart' => possibly a second sale
 
 
 def is_green(cell):
@@ -207,6 +212,43 @@ def parse_date(v):
     return None
 
 
+def day_gap(d1, d2):
+    """Days between two (y, m, d) tuples; None if either is unknown."""
+    if d1 is None or d2 is None:
+        return None
+    return abs((date(*d1) - date(*d2)).days)
+
+
+def month_gap(exp_date, midx):
+    """Days between an export sale date and a recorded row's month block.
+
+    Sheet rows carry no date of their own - only the green month header above
+    them - so the recorded sale is approximated by the middle of that month."""
+    if exp_date is None or midx is None:
+        return None
+    return day_gap(exp_date, (WB_YEAR, midx, 15))
+
+
+def same_sale(a, b):
+    """Two export records for one property: the same sale listed twice?
+
+    Collapsing (step 7) is for one sale filed twice - an exact duplicate, a
+    disclosed row beside its undisclosed 'Pending Settlement Advice' twin, or
+    two spellings of the street. Records months apart with different prices are
+    two different sales and must not be merged into one: 25 Epping Road, Double
+    Bay appears in this very export as a settled Feb sale and a pending Oct
+    re-sale."""
+    gap = day_gap(a['date'], b['date'])
+    if gap is None:
+        return True                      # no usable date: old behaviour
+    if gap > RESALE_DAYS:
+        return False
+    pa, pb = a['price'], b['price']
+    if pa is not None and pb is not None and pa != pb:
+        return False
+    return True
+
+
 def sibling_key(target):
     """'ZETLAND HOUSE' <-> 'ZETLAND UNIT' - the other sheet for the same suburb."""
     if target.endswith(' HOUSE'):
@@ -329,11 +371,28 @@ class Sheet:
         if self.tmpl_month is None and self.headers:
             self.tmpl_month = self.headers[0][0]
 
-    def find(self, parsed):
-        for r, p in self.props:
-            if same_property(parsed, p):
-                return r
+    def month_of(self, row):
+        """Month index of the block this row sits in (None if outside one)."""
+        for b in self.blocks:
+            if b[0] < row <= b[4]:
+                return b[1]
         return None
+
+    def find(self, parsed, midx=None):
+        """Row recording this property, or None.
+
+        A property can legitimately hold two rows once a genuine re-sale has
+        been recorded (25 Epping Road, Double Bay: Feb and Oct). Prefer the row
+        filed under the export's own sale month so the Oct record matches the
+        Oct row rather than the Feb one."""
+        hits = [r for r, p in self.props if same_property(parsed, p)]
+        if not hits:
+            return None
+        if midx is not None:
+            for r in hits:
+                if self.month_of(r) == midx:
+                    return r
+        return hits[0]
 
 
 CELLREF = re.compile(r'(\$?)([A-Z]{1,3})(\$?)(\d+)')
@@ -627,7 +686,8 @@ def main():
         skey[sheet_key(name)] = name
 
     report = {'export': export_path, 'export_rows': len(rows), 'actions': [],
-              'created_sheets': [], 'unmatched_sheets': [], 'consolidated': []}
+              'created_sheets': [], 'unmatched_sheets': [], 'consolidated': [],
+              'second_sales': []}
 
     # ---- build records
     recs = []
@@ -647,7 +707,9 @@ def main():
             'ptype_raw': ptype_raw, 'bed': small_num(r[5]), 'bath': small_num(r[6]),
             'car': small_num(r[7]), 'size': size, 'price': clean_price(r[11]),
             'price_raw': str(r[11]),
-            'date': d, 'date_raw': str(r[12]), 'parsed': parse_addr(addr),
+            'date': d, 'date_raw': str(r[12]),
+            'status': (str(r[14]).strip() if r[14] is not None else ''),
+            'parsed': parse_addr(addr),
             'target': sheet_key(suburb + ' ' + ('HOUSE' if is_house else 'UNIT')),
         })
 
@@ -656,7 +718,9 @@ def main():
     for rec in recs:
         placed = False
         for g in groups:
-            if g[0]['target'] == rec['target'] and same_property(g[0]['parsed'], rec['parsed']):
+            if (g[0]['target'] == rec['target']
+                    and same_property(g[0]['parsed'], rec['parsed'])
+                    and all(same_sale(x, rec) for x in g)):
                 g.append(rec); placed = True; break
         if not placed:
             groups.append([rec])
@@ -748,14 +812,15 @@ def main():
                     if d['sheet'] == name:
                         model[name].donor = d['styled_after']
         sh = model[name]
-        hit = sh.find(rec['parsed'])
+        exp_midx = rec['date'][1] if rec['date'] else None
+        hit = sh.find(rec['parsed'], exp_midx)
         # A property RP Data has reclassified (House <-> Unit) must not be added
         # a second time to the suburb's other sheet.
         sib_name = skey.get(sibling_key(rec['target']))
         if hit is None and sib_name:
             if sib_name not in model:
                 model[sib_name] = Sheet(wb[sib_name])
-            sib_hit = model[sib_name].find(rec['parsed'])
+            sib_hit = model[sib_name].find(rec['parsed'], exp_midx)
             if sib_hit is not None:
                 sh, name, hit = model[sib_name], sib_name, sib_hit
                 report['actions'].append({
@@ -772,12 +837,42 @@ def main():
             ws = sh.ws
             cur = ws.cell(row=hit, column=2).value
             blank = cur is None or str(cur).strip() == ''
+            cur_price = clean_num(cur)
+            # Possibly a second sale of the same property rather than the same
+            # sale re-reported? Only a human decides; change nothing here. A
+            # missed re-sale can never be recovered later, because the
+            # late-price fill below only ever writes into a blank cell.
+            gap = month_gap(rec['date'], sh.month_of(hit))
+            resale = (gap is not None and gap > RESALE_DAYS and (
+                (rec['price'] is not None and cur_price is not None
+                 and rec['price'] != cur_price)
+                or (rec['price'] is None and not blank)))
+            if resale:
+                report['second_sales'].append({
+                    'sheet': name, 'row': hit,
+                    'recorded_addr': str(ws.cell(row=hit, column=1).value),
+                    'recorded_month': MONTHS[sh.month_of(hit)-1],
+                    'recorded_price': cur_price,
+                    'export_addr': rec['addr'], 'export_date': rec['date_raw'],
+                    'export_price': rec['price'],
+                    'export_price_raw': rec['price_raw'],
+                    'export_status': rec.get('status'),
+                    'gap_days_approx': gap})
+                report['actions'].append({'kind': 'possible_second_sale',
+                                          'sheet': name, 'row': hit,
+                                          'addr': rec['addr'],
+                                          'export_date': rec['date_raw']})
+                continue
             if blank and rec['price'] is not None:
                 plans[name]['fills'].append({'row': hit, 'price': rec['price'],
                                              'addr': str(ws.cell(row=hit, column=1).value)})
                 report['actions'].append({'kind': 'fill_price', 'sheet': name, 'row': hit,
                                           'addr': str(ws.cell(row=hit, column=1).value),
-                                          'price': rec['price'], 'export_addr': rec['addr']})
+                                          'price': rec['price'], 'export_addr': rec['addr'],
+                                          'export_date': rec['date_raw'],
+                                          'recorded_month': (MONTHS[sh.month_of(hit)-1]
+                                                             if sh.month_of(hit) else None),
+                                          'gap_days_approx': gap})
             else:
                 already += 1
                 report['actions'].append({'kind': 'skip_existing', 'sheet': name, 'row': hit,
@@ -786,9 +881,30 @@ def main():
                                           'reason': 'price already set' if not blank
                                           else 'no usable price in export'})
         elif pend is not None:
+            # Not the same sale (same_sale kept them apart) and neither is on the
+            # sheet yet. Record the later one and flag the other: dropping both
+            # would lose a sale this rolling export may never list again.
+            if rec['date'] and pend['date'] and date(*rec['date']) > date(*pend['date']):
+                older, newer = pend, rec
+                plans[name]['new'][plans[name]['new'].index(pend)] = rec
+            else:
+                older, newer = rec, pend
             already += 1
-            report['actions'].append({'kind': 'skip_dup_in_run', 'sheet': name,
-                                      'addr': rec['addr']})
+            report['second_sales'].append({
+                'sheet': name, 'row': None, 'recorded_addr': None,
+                'recorded_month': None, 'recorded_price': None,
+                'export_addr': older['addr'], 'export_date': older['date_raw'],
+                'export_price': older['price'],
+                'export_price_raw': older['price_raw'],
+                'export_status': older['status'],
+                'gap_days_approx': day_gap(older['date'], newer['date']),
+                'note': ('two sales of this property in this export and neither '
+                         'was on the sheet; the %s record was added, this one '
+                         'was not' % newer['date_raw'])})
+            report['actions'].append({'kind': 'possible_second_sale_in_export',
+                                      'sheet': name, 'addr': older['addr'],
+                                      'export_date': older['date_raw'],
+                                      'added_instead': newer['date_raw']})
         else:
             if rec['date'] is None:
                 report['actions'].append({'kind': 'skipped_no_date', 'sheet': name,
@@ -804,6 +920,7 @@ def main():
         for r in consolidated if r['price'] is None
         and re.match(r'^[\d.]+$', r['price_raw']) and float(r['price_raw']) <= 1]
     report['already_present'] = already
+    report['second_sales_total'] = len(report['second_sales'])
     report['new_total'] = sum(len(p['new']) for p in plans.values())
     report['fills_total'] = sum(len(p['fills']) for p in plans.values())
     report['per_sheet'] = {k: {'new': len(v['new']), 'fills': len(v['fills'])}
