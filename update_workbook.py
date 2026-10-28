@@ -943,6 +943,8 @@ def main():
 
     # ---------------------------------------------------------------- apply
     write_changes(wb, model, plans, WB_PATH, report)
+    import build_summary          # imported here: it imports this module back
+    build_summary.refresh(WB_PATH, report)
     json.dump(report, open(rpt_path, 'w'), indent=1, default=str)
 
 
