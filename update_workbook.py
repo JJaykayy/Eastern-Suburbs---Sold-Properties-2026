@@ -526,6 +526,8 @@ def write_changes(wb, model, plans, path, report):
                     b = ws.cell(row=new_r, column=2)
                     b.value = f['price']
                     b.number_format = MONEY
+                    if b.fill is not None and b.fill.patternType == 'solid':
+                        b.fill = PatternFill(fill_type=None)
                     g = ws.cell(row=new_r, column=7)
                     size = ws.cell(row=new_r, column=6).value
                     if isinstance(size, (int, float)) and size:
@@ -579,10 +581,12 @@ def write_changes(wb, model, plans, path, report):
                                          color=(BLUE if c == 1 else 'FF000000'),
                                          underline=None)
                         cell.number_format = MONEY if c in (2, 7) else 'General'
-                        # a data row must never carry the month-header fill
-                        if (cell.fill is not None and cell.fill.patternType == 'solid'
-                                and cell.fill.fgColor is not None
-                                and cell.fill.fgColor.rgb == GREEN):
+                        # A data row carries no solid fill. That covers the
+                        # month-header green, and the solid white that some
+                        # template rows hold: white paints over the gridlines,
+                        # so the cell reads as a seamless blank gap.
+                        if (cell.fill is not None
+                                and cell.fill.patternType == 'solid'):
                             cell.fill = PatternFill(fill_type=None)
                     else:
                         cell.number_format = 'General'
