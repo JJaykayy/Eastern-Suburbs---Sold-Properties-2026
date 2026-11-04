@@ -80,7 +80,18 @@ NUM = r'\d+[A-Z]?'
 APAT = re.compile(r'^(?:([A-Z]{0,2}\d+[A-Z]?)\s*/\s*)?(' + NUM + r'(?:\s*-\s*' + NUM + r')?)\s+(.+)$')
 
 
+def strip_empty_unit(s):
+    """RP Data sometimes emits an address whose unit/lot field is empty, leaving
+    a bare leading slash: '/260 MALABAR ROAD' is 260 Malabar Road and
+    '/1 DUTRUC STREET' is 1 Dutruc Street. The slash form matches nothing, so
+    the 4 Nov 2026 export was about to add both beside the rows already
+    recorded for them. Drop the empty unit before matching and before writing.
+    """
+    return re.sub(r'^\s*/\s*', '', str(s))
+
+
 def norm_text(s):
+    s = strip_empty_unit(s)
     s = str(s).upper().replace(' ', ' ')
     s = s.replace(',', ' ').replace('.', ' ').replace('  ', ' ')
     s = re.sub(r'\s+', ' ', s).strip()
@@ -152,7 +163,7 @@ def title_addr(s):
         if m and len(t) > 3:
             t = m.group(1) + m.group(2).upper() + m.group(3)
         return t
-    return ' '.join(fix(t) for t in str(s).split())
+    return ' '.join(fix(t) for t in strip_empty_unit(s).split())
 
 
 def clean_num(v):
